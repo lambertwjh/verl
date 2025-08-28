@@ -218,14 +218,63 @@ class DataParallelPPOActor(BasePPOActor):
                 extra_args["temperature"] = temperature
                 extra_args["return_dict"] = True
 
-            output = self.actor_module(
-                input_ids=input_ids_rmpad,
-                attention_mask=None,
-                position_ids=position_ids_arg,
-                **multi_modal_inputs,
-                use_cache=False,
-                **extra_args,
-            )  # prevent model thinks we are generating
+            # 包裹模型调用，出现异常时打印样本信息
+            try:
+                output = self.actor_module(
+                    input_ids=input_ids_rmpad,
+                    attention_mask=None,
+                    position_ids=position_ids_arg,
+                    **multi_modal_inputs,
+                    use_cache=False,
+                    **extra_args,
+                )  # prevent model thinks we are generating
+            except Exception as e:
+                if os.environ.get("VERL_DEBUG_MMI", "0") == "1":
+                    image_token_id = getattr(getattr(self.actor_module, "config", None), "image_token_id", None)
+                    input_ids0 = micro_batch.get("input_ids", None)
+                    mmi_list0 = micro_batch.get("multi_modal_inputs", None)
+                    extras0 = micro_batch.get("extra_info", None)
+                    try:
+                        merged_keys = list(multi_modal_inputs.keys())
+                    except Exception:
+                        merged_keys = []
+                    print(f"[MMI-ERROR] merged_keys={merged_keys}", flush=True)
+                    if input_ids0 is not None:
+                        bsz = input_ids0.shape[0]
+                        for s in range(bsz):
+                            ids_s = input_ids0[s]
+                            placeholder = int((ids_s == image_token_id).sum().item()) if image_token_id is not None else -1
+                            d = {}
+                            if isinstance(mmi_list0, list) and s < len(mmi_list0) and isinstance(mmi_list0[s], dict):
+                                d = mmi_list0[s]
+                            has_img = bool(d.get("pixel_values") is not None) if d else False
+                            has_vid = bool(d.get("pixel_values_videos") is not None) if d else False
+                            gi = int(d["image_grid_thw"].shape[0]) if d and d.get("image_grid_thw") is not None else 0
+                            gv = int(d["video_grid_thw"].shape[0]) if d and d.get("video_grid_thw") is not None else 0
+                            ident = d.get("id") or d.get("uid") or d.get("source") or d.get("image_paths") or d.get("video_paths")
+                            dataset_index = None
+                            # 回退到 extra_info 读取 mmi_ident / mmi_source / dataset_index
+                            if (ident is None or dataset_index is None) and (extras0 is not None):
+                                try:
+                                    extra_s = extras0[s]
+                                    if isinstance(extra_s, dict):
+                                        ident = (
+                                            ident
+                                            or extra_s.get("mmi_ident")
+                                            or extra_s.get("ident")
+                                            or extra_s.get("mmi_source")
+                                            or extra_s.get("source")
+                                        )
+                                        dataset_index = extra_s.get("dataset_index", dataset_index)
+                                except Exception:
+                                    pass
+                            print(
+                                f"[MMI-ERROR] sample={s} dataset_index={dataset_index} "
+                                f"placeholder={placeholder} has_img={has_img} has_vid={has_vid} "
+                                f"image_grid_rows={gi} video_grid_rows={gv} ident={ident}",
+                                flush=True,
+                            )
+                    raise
 
             if self.use_fused_kernels:
                 log_probs = output.log_probs.squeeze(0)  # (total_nnz,)
@@ -529,4 +578,82 @@ class DataParallelPPOActor(BasePPOActor):
                 mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
                 append_to_dict(metrics, mini_batch_metrics)
         self.actor_optimizer.zero_grad()
+        return metrics
+
+        try:
+            outputs = self.actor_module(
+                input_ids=micro_batch["input_ids"],
+                attention_mask=micro_batch["attention_mask"],
+                position_ids=micro_batch["position_ids"],
+                use_cache=False,
+                **multi_modal_inputs,
+            )
+        except Exception as e:
+            if os.environ.get("VERL_DEBUG_MMI", "0") == "1":
+                image_token_id = getattr(getattr(self.actor_module, "config", None), "image_token_id", None)
+                input_ids = micro_batch.get("input_ids", None)
+                mmi_list = micro_batch.get("multi_modal_inputs", None)
+
+                if input_ids is not None:
+                    bsz = input_ids.shape[0]
+                    for s in range(bsz):
+                        ids_s = input_ids[s]
+                        placeholder = int((ids_s == image_token_id).sum().item()) if image_token_id is not None else -1
+
+                        d = {}
+                        if isinstance(mmi_list, list) and s < len(mmi_list) and isinstance(mmi_list[s], dict):
+                            d = mmi_list[s]
+
+                        has_img = bool(d.get("pixel_values") is not None) if d else False
+                        has_vid = bool(d.get("pixel_values_videos") is not None) if d else False
+                        gi = int(d["image_grid_thw"].shape[0]) if d and d.get("image_grid_thw") is not None else 0
+                        gv = int(d["video_grid_thw"].shape[0]) if d and d.get("video_grid_thw") is not None else 0
+
+                        ident = d.get("id") or d.get("uid") or d.get("source") or d.get("image_paths") or d.get("video_paths")
+                        # 新增：如果有 extra_info，就一起保留，便于异常时精准打印 dataset_index/ident
+                        has_extra_info = "extra_info" in data.non_tensor_batch.keys()
+                        non_tensor_select_keys = []
+                        if has_multi_modal_inputs:
+                            non_tensor_select_keys.append("multi_modal_inputs")
+                        if has_extra_info:
+                            non_tensor_select_keys.append("extra_info")
+                        data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
+                        if input_ids is not None:
+                            bsz = input_ids.shape[0]
+                            for s in range(bsz):
+                                ids_s = input_ids[s]
+                                placeholder = int((ids_s == image_token_id).sum().item()) if image_token_id is not None else -1
+
+                                d = {}
+                                if isinstance(mmi_list, list) and s < len(mmi_list) and isinstance(mmi_list[s], dict):
+                                    d = mmi_list[s]
+
+                                has_img = bool(d.get("pixel_values") is not None) if d else False
+                                has_vid = bool(d.get("pixel_values_videos") is not None) if d else False
+                                gi = int(d["image_grid_thw"].shape[0]) if d and d.get("image_grid_thw") is not None else 0
+                                gv = int(d["video_grid_thw"].shape[0]) if d and d.get("video_grid_thw") is not None else 0
+                                ident = d.get("id") or d.get("uid") or d.get("source") or d.get("image_paths") or d.get("video_paths")
+                                dataset_index = None
+                                # 回退到 extra_info 读取 mmi_ident / mmi_source / dataset_index
+                                if (ident is None or dataset_index is None) and (extras0 is not None):
+                                    try:
+                                        extra_s = extras0[s]
+                                        if isinstance(extra_s, dict):
+                                            ident = (
+                                                ident
+                                                or extra_s.get("mmi_ident")
+                                                or extra_s.get("ident")
+                                                or extra_s.get("mmi_source")
+                                                or extra_s.get("source")
+                                            )
+                                            dataset_index = extra_s.get("dataset_index", dataset_index)
+                                    except Exception:
+                                        pass
+                                print(
+                                    f"[MMI-ERROR] sample={s} dataset_index={dataset_index} "
+                                    f"placeholder={placeholder} has_img={has_img} has_vid={has_vid} "
+                                    f"image_grid_rows={gi} video_grid_rows={gv} ident={ident}",
+                                    flush=True,
+                                )
+                    raise
         return metrics

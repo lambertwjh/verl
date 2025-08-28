@@ -54,7 +54,7 @@ class DataParallelPPOCritic(BasePPOCritic):
         self.ulysses_sequence_parallel_size = self.config.get("ulysses_sequence_parallel_size", 1)
         self.device_name = get_device_name()
 
-    def _forward_micro_batch(self, micro_batch):
+    def _forward_micro_batch(self, micro_batch, seq_length=None):
         response_length = micro_batch["responses"].size(-1)
         multi_modal_inputs = {}
         if "multi_modal_inputs" in micro_batch.keys():
@@ -96,13 +96,60 @@ class DataParallelPPOCritic(BasePPOCritic):
                     )
 
                 # only pass input_ids and position_ids to enable flash_attn_varlen
-                output = self.critic_module(
-                    input_ids=input_ids_rmpad,
-                    attention_mask=None,
-                    position_ids=position_ids_rmpad,
-                    **multi_modal_inputs,
-                    use_cache=False,
-                )  # prevent model thinks we are generating
+                try:
+                    output = self.critic_module(
+                        input_ids=input_ids_rmpad,
+                        attention_mask=None,
+                        position_ids=position_ids_rmpad,
+                        **multi_modal_inputs,
+                        use_cache=False,
+                    )  # prevent model thinks we are generating
+                except Exception:
+                    if os.environ.get("VERL_DEBUG_MMI", "0") == "1":
+                        image_token_id = getattr(getattr(self.critic_module, "config", None), "image_token_id", None)
+                        input_ids0 = micro_batch.get("input_ids", None)
+                        mmi_list0 = micro_batch.get("multi_modal_inputs", None)
+                        extras0 = micro_batch.get("extra_info", None)
+                        try:
+                            merged_keys = list(multi_modal_inputs.keys())
+                        except Exception:
+                            merged_keys = []
+                        print(f"[MMI-ERROR-CRITIC] merged_keys={merged_keys}", flush=True)
+                        if input_ids0 is not None:
+                            bsz = input_ids0.shape[0]
+                            for s in range(bsz):
+                                ids_s = input_ids0[s]
+                                placeholder = int((ids_s == image_token_id).sum().item()) if image_token_id is not None else -1
+                                d = {}
+                                if isinstance(mmi_list0, list) and s < len(mmi_list0) and isinstance(mmi_list0[s], dict):
+                                    d = mmi_list0[s]
+                                has_img = bool(d.get("pixel_values") is not None) if d else False
+                                has_vid = bool(d.get("pixel_values_videos") is not None) if d else False
+                                gi = int(d["image_grid_thw"].shape[0]) if d and d.get("image_grid_thw") is not None else 0
+                                gv = int(d["video_grid_thw"].shape[0]) if d and d.get("video_grid_thw") is not None else 0
+                                ident = d.get("id") or d.get("uid") or d.get("source") or d.get("image_paths") or d.get("video_paths")
+                                dataset_index = None
+                                if (ident is None or dataset_index is None) and (extras0 is not None):
+                                    try:
+                                        extra_s = extras0[s]
+                                        if isinstance(extra_s, dict):
+                                            ident = (
+                                                ident
+                                                or extra_s.get("mmi_ident")
+                                                or extra_s.get("ident")
+                                                or extra_s.get("mmi_source")
+                                                or extra_s.get("source")
+                                            )
+                                            dataset_index = extra_s.get("dataset_index", dataset_index)
+                                    except Exception:
+                                        pass
+                                print(
+                                    f"[MMI-ERROR-CRITIC] sample={s} dataset_index={dataset_index} "
+                                    f"placeholder={placeholder} has_img={has_img} has_vid={has_vid} "
+                                    f"image_grid_rows={gi} video_grid_rows={gv} ident={ident}",
+                                    flush=True,
+                                )
+                    raise
 
                 if hasattr(self.critic_module, "v_head"):
                     # For trl.AutoModelForCausalLMWithValueHead
@@ -121,13 +168,60 @@ class DataParallelPPOCritic(BasePPOCritic):
                 values = pad_input(values_rmpad, indices=indices, batch=batch, seqlen=seqlen).squeeze(-1)
                 values = values[:, -response_length - 1 : -1]
             else:
-                output = self.critic_module(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    position_ids=position_ids,
-                    **multi_modal_inputs,
-                    use_cache=False,
-                )  # prevent model thinks we are generating
+                try:
+                    outputs = self.critic_module(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        position_ids=position_ids,
+                        multi_modal_inputs=multi_modal_inputs if len(multi_modal_inputs) > 0 else None,
+                        use_cache=False,
+                    )  # prevent model thinks we are generating
+                except Exception:
+                    if os.environ.get("VERL_DEBUG_MMI", "0") == "1":
+                        image_token_id = getattr(getattr(self.critic_module, "config", None), "image_token_id", None)
+                        input_ids0 = micro_batch.get("input_ids", None)
+                        mmi_list0 = micro_batch.get("multi_modal_inputs", None)
+                        extras0 = micro_batch.get("extra_info", None)
+                        try:
+                            merged_keys = list(multi_modal_inputs.keys())
+                        except Exception:
+                            merged_keys = []
+                        print(f"[MMI-ERROR-CRITIC] merged_keys={merged_keys}", flush=True)
+                        if input_ids0 is not None:
+                            bsz = input_ids0.shape[0]
+                            for s in range(bsz):
+                                ids_s = input_ids0[s]
+                                placeholder = int((ids_s == image_token_id).sum().item()) if image_token_id is not None else -1
+                                d = {}
+                                if isinstance(mmi_list0, list) and s < len(mmi_list0) and isinstance(mmi_list0[s], dict):
+                                    d = mmi_list0[s]
+                                has_img = bool(d.get("pixel_values") is not None) if d else False
+                                has_vid = bool(d.get("pixel_values_videos") is not None) if d else False
+                                gi = int(d["image_grid_thw"].shape[0]) if d and d.get("image_grid_thw") is not None else 0
+                                gv = int(d["video_grid_thw"].shape[0]) if d and d.get("video_grid_thw") is not None else 0
+                                ident = d.get("id") or d.get("uid") or d.get("source") or d.get("image_paths") or d.get("video_paths")
+                                dataset_index = None
+                                if (ident is None or dataset_index is None) and (extras0 is not None):
+                                    try:
+                                        extra_s = extras0[s]
+                                        if isinstance(extra_s, dict):
+                                            ident = (
+                                                ident
+                                                or extra_s.get("mmi_ident")
+                                                or extra_s.get("ident")
+                                                or extra_s.get("mmi_source")
+                                                or extra_s.get("source")
+                                            )
+                                            dataset_index = extra_s.get("dataset_index", dataset_index)
+                                    except Exception:
+                                        pass
+                                print(
+                                    f"[MMI-ERROR-CRITIC] sample={s} dataset_index={dataset_index} "
+                                    f"placeholder={placeholder} has_img={has_img} has_vid={has_vid} "
+                                    f"image_grid_rows={gi} video_grid_rows={gv} ident={ident}",
+                                    flush=True,
+                                )
+                    raise
                 if hasattr(self.critic_module, "v_head"):
                     # For trl.AutoModelForCausalLMWithValueHead
                     values = output[2]
@@ -201,7 +295,13 @@ class DataParallelPPOCritic(BasePPOCritic):
 
         select_keys = ["input_ids", "responses", "response_mask", "attention_mask", "position_ids", "values", "returns"]
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
-        non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
+        # 新增：保留 extra_info
+        has_extra_info = "extra_info" in data.non_tensor_batch.keys()
+        non_tensor_select_keys = []
+        if has_multi_modal_inputs:
+            non_tensor_select_keys.append("multi_modal_inputs")
+        if has_extra_info:
+            non_tensor_select_keys.append("extra_info")
 
         data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
 

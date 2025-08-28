@@ -194,83 +194,153 @@ class RLHFDataset(Dataset):
 
     def _build_messages(self, example: dict):
         messages: list = example.pop(self.prompt_key)
-
-        if self.image_key in example or self.video_key in example:
-            for message in messages:
-                content = message["content"]
-                content_list = []
-                segments = re.split("(<image>|<video>)", content)
-                segments = [item for item in segments if item != ""]
-                for segment in segments:
-                    if segment == "<image>":
-                        content_list.append({"type": "image"})
-                    elif segment == "<video>":
-                        content_list.append({"type": "video"})
-                    else:
-                        content_list.append({"type": "text", "text": segment})
-
-                message["content"] = content_list
-
+    
+        # 新增：严格模式开关（默认 False，防止影响其他模型）
+        strict = bool(getattr(self.config, "strict_multimodal_placeholders", False))
+    
+        if strict:
+            # 严格模式：只有存在真实图像/视频数据才保留占位符并结构化，否则清理占位符
+            has_image_data = self.image_key in example and example.get(self.image_key, None) not in (None, [], ())
+            has_video_data = self.video_key in example and example.get(self.video_key, None) not in (None, [], ())
+    
+            if has_image_data or has_video_data:
+                for message in messages:
+                    content = message["content"]
+                    content_list = []
+                    # 若 content 已是列表，直接保留（假设外部已结构化）
+                    if isinstance(content, list):
+                        message["content"] = content
+                        continue
+                    segments = re.split("(<image>|<video>)", content)
+                    segments = [item for item in segments if item != ""]
+                    for segment in segments:
+                        if segment == "<image>":
+                            content_list.append({"type": "image"})
+                        elif segment == "<video>":
+                            content_list.append({"type": "video"})
+                        else:
+                            content_list.append({"type": "text", "text": segment})
+                    message["content"] = content_list
+            else:
+                # 无真实多模态数据，清理占位符，避免产生占位 token
+                for message in messages:
+                    if isinstance(message["content"], str):
+                        message["content"] = (
+                            message["content"]
+                            .replace("<image>", "")
+                            .replace("<video>", "")
+                        )
+        else:
+            # 旧逻辑（保持兼容）：只要字段存在（即便为 None），也会结构化占位符
+            if self.image_key in example or self.video_key in example:
+                for message in messages:
+                    content = message["content"]
+                    content_list = []
+                    segments = re.split("(<image>|<video>)", content)
+                    segments = [item for item in segments if item != ""]
+                    for segment in segments:
+                        if segment == "<image>":
+                            content_list.append({"type": "image"})
+                        elif segment == "<video>":
+                            content_list.append({"type": "video"})
+                        else:
+                            content_list.append({"type": "text", "text": segment})
+                    message["content"] = content_list
+    
         return messages
-
+    
     def __getitem__(self, item):
         """
         Note that we also return the raw_input_ids so that it can be combined with other chat template
         """
         row_dict: dict = self.dataframe[item]
         messages = self._build_messages(row_dict)
+        # 确保每条样本都带上 dataset_index（用于精准回溯），并兜底 ident/source
+        row_dict.setdefault("extra_info", {})
+        if not isinstance(row_dict["extra_info"], dict):
+            row_dict["extra_info"] = {}
+        row_dict["extra_info"]["dataset_index"] = int(item)
+        row_dict["extra_info"].setdefault("mmi_ident", str(row_dict.get("id", item)))
+        row_dict["extra_info"].setdefault(
+            "mmi_source",
+            row_dict.get("source") or row_dict.get("image_paths") or row_dict.get("video_paths"),
+        )
+    
         model_inputs = {}
-
+    
         if self.processor is not None:
             from verl.utils.dataset.vision_utils import process_image, process_video
-
+    
             raw_prompt = self.processor.apply_chat_template(
                 messages, add_generation_prompt=True, tokenize=False, **self.apply_chat_template_kwargs
             )
             multi_modal_data = {}
-
+    
             images = None
             if self.image_key in row_dict and row_dict.get(self.image_key, None) is not None:
                 images = [process_image(image) for image in row_dict.pop(self.image_key)]
-
+    
                 # due to the image key is "image" instead of "images" in vllm, we need to use "image" here
                 # link: https://github.com/vllm-project/vllm/blob/3c545c0c3b98ee642373a308197d750d0e449403/vllm/multimodal/parse.py#L205
                 multi_modal_data["image"] = images
-
+    
             videos = None
             if self.video_key in row_dict and row_dict.get(self.video_key, None) is not None:
                 videos = [process_video(video) for video in row_dict.pop(self.video_key)]
-
+    
                 # due to the video key is "video" instead of "videos" in vllm, we need to use "video" here
                 # link: https://github.com/vllm-project/vllm/blob/3c545c0c3b98ee642373a308197d750d0e449403/vllm/multimodal/parse.py#L205
                 multi_modal_data["video"] = [video.numpy() for video in videos]
-
+    
             model_inputs = self.processor(text=[raw_prompt], images=images, videos=videos, return_tensors="pt")
-
+    
             input_ids = model_inputs.pop("input_ids")
             attention_mask = model_inputs.pop("attention_mask")
-
+    
             if "second_per_grid_ts" in model_inputs:
                 model_inputs.pop("second_per_grid_ts")
-
+    
             # There's a trap here, multi_modal_inputs has to be a dict, not BatchFeature
             row_dict["multi_modal_data"] = multi_modal_data
-
+    
             # We will do batch.union() in the trainer,
             # so we cannot have "multi_modal_inputs" in row_dict if rollout generates new multi_modal_inputs
             if self.return_multi_modal_inputs:
                 row_dict["multi_modal_inputs"] = dict(model_inputs)
-
                 # second_per_grid_ts isn't used for training, just for mrope
                 row_dict["multi_modal_inputs"].pop("second_per_grid_ts", None)
-
-        else:
-            raw_prompt = self.tokenizer.apply_chat_template(
-                messages, add_generation_prompt=True, tokenize=False, **self.apply_chat_template_kwargs
-            )
-            model_inputs = self.tokenizer(raw_prompt, return_tensors="pt", add_special_tokens=False)
-            input_ids = model_inputs.pop("input_ids")
-            attention_mask = model_inputs.pop("attention_mask")
+    
+                # 严格模式下，如果确实没有图像/视频数据，进一步移除所有视觉相关键，避免后续并集合并误判
+                strict = bool(getattr(self.config, "strict_multimodal_placeholders", False))
+                no_mm = (images is None or len(images) == 0) and (videos is None or len(videos) == 0)
+                if strict and no_mm:
+                    for k in [
+                        "pixel_values",
+                        "pixel_values_videos",
+                        "image_grid_thw",
+                        "video_grid_thw",
+                        "image_sizes",
+                        "video_sizes",
+                    ]:
+                        row_dict["multi_modal_inputs"].pop(k, None)
+    
+                # 注：不再把 id/source 放到 multi_modal_inputs，避免 torch.cat 字符串报错
+                row_dict.setdefault("extra_info", {})
+                if not isinstance(row_dict["extra_info"], dict):
+                    row_dict["extra_info"] = {}
+                row_dict["extra_info"]["mmi_ident"] = str(row_dict.get("id", item))
+                row_dict["extra_info"]["mmi_source"] = (
+                    row_dict.get("source")
+                    or row_dict.get("image_paths")
+                    or row_dict.get("video_paths")
+                )
+            else:
+                raw_prompt = self.tokenizer.apply_chat_template(
+                    messages, add_generation_prompt=True, tokenize=False, **self.apply_chat_template_kwargs
+                )
+                model_inputs = self.tokenizer(raw_prompt, return_tensors="pt", add_special_tokens=False)
+                input_ids = model_inputs.pop("input_ids")
+                attention_mask = model_inputs.pop("attention_mask")
 
         input_ids, attention_mask = verl_F.postprocess_data(
             input_ids=input_ids,
